@@ -1,0 +1,32 @@
+name: Build Inkwell PPW4
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build installer
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            alpine:3.24 sh -ec '
+              apk add --no-cache clang llvm lld cmake samurai \
+                python3 e2fsprogs e2fsprogs-extra perl-utils \
+                curl zip xz binutils git
+              QUICK_ONLY=1 sh tools/fetch.sh
+              sh tools/release.sh ppw4-local
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Inkwell-PPW4
+          path: dist/
+          if-no-files-found: error
