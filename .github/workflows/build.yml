@@ -21,7 +21,8 @@ jobs:
               apk add --no-cache clang llvm lld cmake samurai \
                 python3 e2fsprogs e2fsprogs-extra perl-utils \
                 curl zip xz binutils git
-              QUICK_ONLY=1 sh tools/fetch.sh
+                                git config --global --add safe.directory /work
+                  sed -i 's| kindle/linux/dashboard.conf.example||' tools/release.shQUICK_ONLY=1 sh tools/fetch.sh
               sh tools/release.sh ppw4-local
             '
 
