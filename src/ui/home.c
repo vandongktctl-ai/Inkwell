@@ -12,12 +12,58 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <dirent.h>
 
 
 typedef struct { char label[32], icon[16], cmd[200]; rect r; } app;
 static app apps[16];
 static int napps;
 static char device_name[64] = "Inkwell";
+static int app_page;
+#define APPS_PER_PAGE 9
+#ifndef READER_STATE_DIR
+#define READER_STATE_DIR "/mnt/us/linux/reader"
+#endif
+static char recent_path[512], recent_title[200];
+static int recent_page, recent_pages;
+
+/* Read small saved-state files only; never open an EPUB/PDF to draw Home. */
+static void load_recent(void) {
+    DIR *dir = opendir(READER_STATE_DIR);
+    struct dirent *de;
+    long latest = 0;
+    recent_path[0] = recent_title[0] = 0;
+    recent_page = recent_pages = 0;
+    if (!dir) return;
+    while ((de = readdir(dir))) {
+        size_t len = strlen(de->d_name);
+        if (len < 4 || strcmp(de->d_name + len - 4, ".txt")) continue;
+        char name[800], line[800], path[512] = "", title[200] = "";
+        long opened = 0;
+        int page = 0, pages = 0;
+        snprintf(name, sizeof name, "%s/%s", READER_STATE_DIR, de->d_name);
+        FILE *f = fopen(name, "r");
+        if (!f) continue;
+        while (fgets(line, sizeof line, f)) {
+            line[strcspn(line, "\n")] = 0;
+            if (!strncmp(line, "path ", 5)) snprintf(path, sizeof path, "%s", line + 5);
+            else if (!strncmp(line, "title ", 6)) snprintf(title, sizeof title, "%s", line + 6);
+            else if (!strncmp(line, "opened ", 7)) opened = atol(line + 7);
+            else if (!strncmp(line, "page ", 5)) page = atoi(line + 5);
+            else if (!strncmp(line, "pages ", 6)) pages = atoi(line + 6);
+        }
+        fclose(f);
+        struct stat st;
+        if (opened <= latest || !path[0] || stat(path, &st) || !S_ISREG(st.st_mode)) continue;
+        latest = opened;
+        snprintf(recent_path, sizeof recent_path, "%s", path);
+        snprintf(recent_title, sizeof recent_title, "%s", title[0] ? title : strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
+        recent_page = page < 0 ? 0 : page;
+        recent_pages = pages > 0 ? pages : 0;
+        if (recent_pages && recent_page >= recent_pages) recent_page = recent_pages - 1;
+    }
+    closedir(dir);
+}
 
 static int read_int(const char *path) {
     FILE *f = fopen(path, "r");
@@ -78,10 +124,10 @@ static void save_config(void) {
 /* ---- layout ------------------------------------------------------------------- */
 
 #define STATUS_Y 34
-#define CLOCK_Y 70
-#define DATE_Y 318
-#define RULE_Y 440
-#define GRID_Y 490
+#define CLOCK_Y 84
+#define DATE_Y 224
+#define RULE_Y 292
+#define GRID_Y 474
 #define CELL_H 250
 #define GRID_BOTTOM 1262
 static int cell_h = CELL_H;
@@ -90,15 +136,19 @@ static int cell_h = CELL_H;
 
 static rect slider_r;
 static int slider_x0, slider_x1;
+static const rect resume_r = {MARGIN, 316, 960, 130};
+static const rect page_r = {792, 216, 224, 64};
 
 static void layout(void) {
-    /* Three columns hold nine apps. More than that goes to four columns,
-     * which keeps the rows the same height. */
-    int ncol = napps > 9 ? 4 : 3, cw = (W - 2 * MARGIN) / ncol;
+    /* Nine generous targets per page, even with all fifteen apps installed. */
+    int ncol = 3, cw = (W - 2 * MARGIN) / ncol;
     /* A fourth row makes the cells shorter, and draw_app scales to them. */
-    int nrow = (napps + ncol - 1) / ncol;
+    int nrow = 3;
     cell_h = nrow * CELL_H > GRID_BOTTOM - GRID_Y ? (GRID_BOTTOM - GRID_Y) / nrow : CELL_H;
-    for (int i = 0; i < napps; i++) apps[i].r = (rect){MARGIN + (i % ncol) * cw, GRID_Y + (i / ncol) * cell_h, cw, cell_h};
+    for (int i = 0; i < napps; i++) {
+        int slot = i % APPS_PER_PAGE;
+        apps[i].r = (rect){MARGIN + (slot % ncol) * cw, GRID_Y + (slot / ncol) * cell_h, cw, cell_h};
+    }
     slider_x0 = MARGIN + 90;
     slider_x1 = W - MARGIN - 130;
     slider_r = (rect){MARGIN, SLIDER_Y - 20, W - 2 * MARGIN, SLIDER_H + 40};
@@ -140,12 +190,29 @@ static void draw_clock(void) {
     strftime(hm, sizeof hm, "%H:%M", tm);
     strftime(date, sizeof date, "%A, %-d %B", tm);
     fill(0, CLOCK_Y, W, RULE_Y - 20 - CLOCK_Y, WHITE);
-    text(&f_serif_bold, 290, MARGIN - 8, CLOCK_Y - 20, hm, BLACK);
-    text(&f_serif_italic, 62, MARGIN, DATE_Y, date, 0x30);
+    text(&f_serif_bold, 166, MARGIN - 4, CLOCK_Y - 16, hm, BLACK);
+    text(&f_ui, 38, MARGIN, DATE_Y + 8, date, 0x30);
+    if (napps > APPS_PER_PAGE) {
+        char label[32];
+        snprintf(label, sizeof label, "Apps %d/%d", app_page + 1, (napps + APPS_PER_PAGE - 1) / APPS_PER_PAGE);
+        pill(page_r, label, 0);
+    }
+}
+
+static void draw_resume(void) {
+    char fit[240], detail[80];
+    rrect_line(resume_r.x + 2, resume_r.y + 2, resume_r.w - 4, resume_r.h - 4, 16, 3, BLACK);
+    icon("book", MARGIN + 55, resume_r.y + 65, 68);
+    text(&f_ui_bold, 24, MARGIN + 108, resume_r.y + 16, recent_path[0] ? "CONTINUE READING" : "YOUR LIBRARY", 0x40);
+    text_fit(&f_ui_bold, 34, recent_path[0] ? recent_title : "Open Books", resume_r.w - 320, fit, sizeof fit);
+    text(&f_ui_bold, 34, MARGIN + 108, resume_r.y + 57, fit, BLACK);
+    if (recent_pages) snprintf(detail, sizeof detail, "%d%%", (int)((recent_page + 1.0) * 100 / recent_pages));
+    else snprintf(detail, sizeof detail, "Open");
+    text_right(&f_ui_bold, 32, resume_r.x + resume_r.w - 30, resume_r.y + 54, detail, BLACK);
 }
 
 static int app_at(int x, int y) {
-    for (int i = 0; i < napps; i++) if (hit(apps[i].r, x, y)) return i;
+    for (int i = app_page * APPS_PER_PAGE; i < napps && i < (app_page + 1) * APPS_PER_PAGE; i++) if (hit(apps[i].r, x, y)) return i;
     return -1;
 }
 
@@ -200,10 +267,11 @@ static void draw_home(int flash) {
     draw_status();
     draw_clock();
     ornament(RULE_Y);
-    for (int i = 0; i < napps; i++) draw_app(&apps[i]);
+    draw_resume();
+    for (int i = app_page * APPS_PER_PAGE; i < napps && i < (app_page + 1) * APPS_PER_PAGE; i++) draw_app(&apps[i]);
     draw_slider();
     time_t now = time(0);
-    text_center(&f_hand, 46, W / 2, H - 82, footers[(now / 86400) % (sizeof footers / sizeof *footers)], 0x50);
+    text_center(&f_ui, 26, W / 2, H - 52, footers[(now / 86400) % (sizeof footers / sizeof *footers)], 0x50);
     if (flash) flip_flash(); else flip();
 }
 
@@ -215,7 +283,10 @@ static int run_app(const app *a) {
     pid_t pid = fork();
     if (pid == 0) {
         setsid();
-        execl("/bin/sh", "sh", "-c", a->cmd, (char *)0);
+        /* Recent filenames are data, never interpolated into a shell. */
+        if (!a && recent_path[0]) execl("/usr/local/bin/books", "books", recent_path, (char *)0);
+        else if (!a) execl("/usr/local/bin/books", "books", (char *)0);
+        else execl("/bin/sh", "sh", "-c", a->cmd, (char *)0);
         _exit(127);
     }
     if (pid > 0) waitpid(pid, &st, 0);
@@ -241,6 +312,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--sleep-preview") == 0) { draw_night(); refresh_all(); return 0; }
     input_open();
     load_config();
+    load_recent();
     layout();
     draw_home(1);
     want_moves = 1; /* to follow an app being dragged */
@@ -267,9 +339,11 @@ int main(int argc, char **argv) {
         }
         if (e.type == EV_DOWN) {
             drag = over = -1;
+            if (hit(resume_r, e.x, e.y)) { press_on(resume_r); continue; }
+            if (napps > APPS_PER_PAGE && hit(page_r, e.x, e.y)) { press_on(page_r); continue; }
             if (hit(slider_r, e.x, e.y)) { set_light_from(e.x); draw_slider(); refresh(slider_r.x, slider_r.y, slider_r.w, slider_r.h, WF_A2, 0, 0); continue; }
             drag = app_at(e.x, e.y);
-            for (int i = 0; i < napps; i++)
+            for (int i = app_page * APPS_PER_PAGE; i < napps && i < (app_page + 1) * APPS_PER_PAGE; i++)
                 if (hit(apps[i].r, e.x, e.y)) {
                     int cx = apps[i].r.x + apps[i].r.w / 2;
                     int r = (int)(84 * cell_h / (float)CELL_H);
@@ -278,6 +352,17 @@ int main(int argc, char **argv) {
             continue;
         }
         if (e.type != EV_TAP) continue;
+        if (hit(resume_r, e.x, e.y) && hit(resume_r, e.ux, e.uy)) {
+            press_forget();
+            int rc = run_app(0);
+            if (rc >= 10 && rc <= 12) return rc;
+            load_recent(); draw_home(0); continue;
+        }
+        if (napps > APPS_PER_PAGE && hit(page_r, e.x, e.y) && hit(page_r, e.ux, e.uy)) {
+            press_forget();
+            app_page = (app_page + 1) % ((napps + APPS_PER_PAGE - 1) / APPS_PER_PAGE);
+            draw_home(0); continue;
+        }
         if (hit(slider_r, e.x, e.y)) {
             set_light_from(e.ux);
             draw_slider();
@@ -300,12 +385,13 @@ int main(int argc, char **argv) {
         }
         if (from >= 0 && to != from) { press_off(); draw_home(0); continue; } /* dragged off the grid: nothing */
         int launched = 0;
-        for (int i = 0; i < napps; i++) {
+        for (int i = app_page * APPS_PER_PAGE; i < napps && i < (app_page + 1) * APPS_PER_PAGE; i++) {
             if (!hit(apps[i].r, e.x, e.y)) continue;
             press_forget();
             launched = 1;
             int rc = run_app(&apps[i]);
             if (rc >= 10 && rc <= 12) return rc;
+            load_recent();
             draw_home(0);
             break;
         }
