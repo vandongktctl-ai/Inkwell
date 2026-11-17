@@ -1,0 +1,20 @@
+# Inkwell Dashboard configuration example
+# Copy this file to dashboard.conf and uncomment the settings you need.
+# See README.md: The Dashboard. Omitted sources are not shown.
+
+# refresh_minutes = 15
+# days = 3
+# units = metric
+# sleep_screen = no
+
+# Weather: provide your location.
+# latitude = 0.0
+# longitude = 0.0
+# place = Your city
+
+# Calendars: one iCal URL per line. Keep private calendar URLs secret.
+# ics = https://example.com/calendar.ics
+
+# Computer dashboard: use the values printed by tools/dashboard-server.py.
+# server = http://YOUR_COMPUTER:PORT
+# token = YOUR_TOKEN
