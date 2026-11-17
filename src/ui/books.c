@@ -20,7 +20,9 @@
 #include <sys/wait.h>
 
 #define DOCS "/mnt/us/documents"
+#ifndef STATE_DIR
 #define STATE_DIR "/mnt/us/linux/reader"
+#endif
 #define PAGE_PGM "/tmp/inkwell-page.pgm"
 #define THUMB_PGM "/tmp/inkwell-thumb.pgm"
 #define FOOT 58
@@ -170,13 +172,16 @@ static int read_pgm(const char *path, image *im) {
     }
     fgetc(f);
     w = vals[0]; h = vals[1]; mx = vals[2];
-    if (w <= 0 || h <= 0 || mx != 255) { fclose(f); return -1; }
-    free(im->px);
-    im->px = malloc((size_t)w * h);
-    im->w = w; im->h = h;
-    size_t got = fread(im->px, 1, (size_t)w * h, f);
+    if (w <= 0 || h <= 0 || mx != 255 || (size_t)w > 64 * 1024 * 1024 / (size_t)h) { fclose(f); return -1; }
+    size_t size = (size_t)w * h;
+    unsigned char *pixels = malloc(size);
+    if (!pixels) { fclose(f); return -1; }
+    size_t got = fread(pixels, 1, size, f);
     fclose(f);
-    return got == (size_t)w * h ? 0 : -1;
+    if (got != size) { free(pixels); return -1; }
+    free(im->px);
+    *im = (image){w, h, pixels};
+    return 0;
 }
 
 /* Comics are pictures: their greys are dithered between the panel's 16
@@ -185,6 +190,23 @@ static int blit_dither;
 
 /* Copies part of an image into the page at (dx, dy), clipped to the view. */
 static void blit(const image *im, int sx, int sy, int w, int h, int dx, int dy) {
+    /* EPUB and PDF pixels already have the right greys. Copy clipped rows
+     * instead of testing bounds and dithering mode once for every pixel. */
+    if (!blit_dither) {
+        int left = 0, right = w, top = 0, bottom = h;
+        if (dx < 0) left = -dx;
+        if (sx < 0 && -sx > left) left = -sx;
+        if (W - dx < right) right = W - dx;
+        if (im->w - sx < right) right = im->w - sx;
+        if (dy < 0) top = -dy;
+        if (sy < 0 && -sy > top) top = -sy;
+        if (VIEW_H - dy < bottom) bottom = VIEW_H - dy;
+        if (im->h - sy < bottom) bottom = im->h - sy;
+        if (right <= left || bottom <= top) return;
+        for (int j = top; j < bottom; j++)
+            memcpy(fb + (dy + j) * PITCH + dx + left, im->px + (sy + j) * im->w + sx + left, (size_t)(right - left));
+        return;
+    }
     for (int j = 0; j < h; j++) {
         int y = dy + j, iy = sy + j;
         if (y < 0 || y >= VIEW_H || iy < 0 || iy >= im->h) continue;
@@ -263,8 +285,8 @@ static void save_state(void) {
     state_path(bk.path, p, sizeof p);
     FILE *f = save_begin(p);
     if (!f) return;
-    fprintf(f, "path %s\ntitle %s\npage %d\npages %d\nem %d\nmode %d\nopened %ld\n", bk.path, bk.title, bk.page, bk.pages,
-            bk.em, bk.mode, bk.opened);
+    fprintf(f, "path %s\ntitle %s\npage %d\npages %d\nem %d\nmode %d\npart %d\nnparts %d\nopened %ld\n", bk.path, bk.title, bk.page, bk.pages,
+            bk.em, bk.mode, bk.part, bk.nparts, bk.opened);
     for (int i = 0; i < bk.nmarks; i++) fprintf(f, "mark %d\n", bk.marks[i]);
     save_end(f, p, 0);
 }
@@ -285,6 +307,8 @@ static void load_state(const char *doc, book *b) {
         else if (!strcmp(line, "pages")) b->pages = atoi(v);
         else if (!strcmp(line, "em")) b->em = atoi(v);
         else if (!strcmp(line, "mode")) b->mode = atoi(v);
+        else if (!strcmp(line, "part")) b->part = atoi(v);
+        else if (!strcmp(line, "nparts")) b->nparts = atoi(v);
         else if (!strcmp(line, "opened")) b->opened = atol(v);
         else if (!strcmp(line, "mark") && b->nmarks < 100) b->marks[b->nmarks++] = atoi(v);
     }
@@ -311,6 +335,17 @@ static int marked(int page) {
  * that each part of the page uses. */
 static image pg;
 static int pg_page = -1, pg_mode = -1, pg_em = -1;
+/* One previous reflowed page costs about 1.5 MiB at PW4 resolution. It
+ * makes back/forward correction instant at the renderer, without idle
+ * prefetch, extra processes, or retaining large PDF/comic bitmaps. */
+static image previous_pg;
+static int previous_page = -1, previous_em = -1;
+static void clear_page_cache(void) {
+    free(previous_pg.px);
+    memset(&previous_pg, 0, sizeof previous_pg);
+    previous_page = previous_em = -1;
+    pg_page = pg_mode = pg_em = -1;
+}
 typedef struct { int x, y, w, h; } region;
 static region parts[24];
 
@@ -446,7 +481,25 @@ static int prepare(void) {
     char r[256];
     if (pg_page == bk.page && pg_mode == bk.mode && pg_em == bk.em) return 0;
     if (bk.reflow) {
-        if (!ask(r, sizeof r, "render\t%d\t1\t%s", bk.page, PAGE_PGM) || read_pgm(PAGE_PGM, &pg)) return -1;
+        if (previous_page == bk.page && previous_em == bk.em) {
+            image swap = pg; pg = previous_pg; previous_pg = swap;
+            previous_page = pg_page; previous_em = pg_em;
+        } else {
+            /* Read into a fresh image: a failed render must not poison the
+             * current page or the cache. Bound the extra bitmap to 4 MiB. */
+            image next = {0, 0, 0};
+            if (!ask(r, sizeof r, "render\t%d\t1\t%s", bk.page, PAGE_PGM) || read_pgm(PAGE_PGM, &next)) {
+                free(next.px);
+                return -1;
+            }
+            free(previous_pg.px);
+            memset(&previous_pg, 0, sizeof previous_pg);
+            previous_page = previous_em = -1;
+            if (pg_page >= 0 && pg_mode == bk.mode && pg_em == bk.em && pg.px && (size_t)pg.w * pg.h <= 4 * 1024 * 1024) {
+                previous_pg = pg; previous_page = pg_page; previous_em = pg_em;
+            } else free(pg.px);
+            pg = next;
+        }
         bk.nparts = 1;
         parts[0] = (region){0, 0, pg.w, pg.h};
     } else {
@@ -693,10 +746,13 @@ static void draw_menu(void) {
 static const char *title_hint; /* from arXiv, whose PDFs carry no title */
 static int open_book(const char *path) {
     char r[1200];
+    clear_page_cache();
     memset(&bk, 0, sizeof bk);
     snprintf(bk.path, sizeof bk.path, "%s", path);
     bk.em = 30;
     load_state(path, &bk);
+    if (bk.em < EMS[0] || bk.em > EMS[NEMS - 1]) bk.em = 30;
+    if (bk.mode < 0 || bk.mode > 2) bk.mode = 0;
     const char *dot = strrchr(path, '.');
     bk.comic = dot && (!strcasecmp(dot, ".cbz") || !strcasecmp(dot, ".cbt"));
     if (bk.comic && !bk.opened) bk.mode = 2; /* a new comic opens in Panels */
@@ -712,7 +768,7 @@ static int open_book(const char *path) {
     if (!bk.title[0]) file_title(path, bk.title, sizeof bk.title);
     snprintf(bk.author, sizeof bk.author, "%s", author);
     /* the same font size gives the same pages; otherwise keep the place by fraction */
-    if (saved_pages && saved_pages != bk.pages && bk.reflow) bk.page = (int)((float)bk.page / saved_pages * bk.pages);
+    if (saved_pages && saved_pages != bk.pages && bk.reflow) { bk.page = (int)((float)bk.page / saved_pages * bk.pages); bk.part = 0; }
     if (bk.page >= bk.pages) bk.page = bk.pages - 1;
     if (bk.page < 0) bk.page = 0;
     bk.opened = (long)time(0);
@@ -725,8 +781,9 @@ static void relayout(int em_index) {
     char r[128];
     int old = bk.pages ? bk.pages : 1;
     float frac = (float)bk.page / old;
-    bk.em = EMS[em_index];
-    if (ask(r, sizeof r, "layout\t%d\t%d\t%d", W, VIEW_H, bk.em)) {
+    int next_em = EMS[em_index];
+    if (ask(r, sizeof r, "layout\t%d\t%d\t%d", W, VIEW_H, next_em)) {
+        bk.em = next_em;
         bk.pages = field_int(r, 1);
         /* bookmarks keep their place in the book, not their page number */
         for (int i = 0; i < bk.nmarks; i++) bk.marks[i] = (int)((float)bk.marks[i] / old * bk.pages);
@@ -735,7 +792,7 @@ static void relayout(int em_index) {
         if (bk.page < 0) bk.page = 0;
     }
     bk.part = 0;
-    pg_page = -1;
+    clear_page_cache();
 }
 
 static int em_index(void) {
@@ -747,8 +804,10 @@ static int em_index(void) {
 static void go(int page, int part) {
     bk.page = page;
     bk.part = part;
-    save_state();
     draw_page();
+    /* prepare() resolves -1 into the last PDF strip/comic panel. Save that
+     * resolved position so reopening a book restores the exact view. */
+    save_state();
     flip();
 }
 
@@ -760,7 +819,7 @@ static void read_book(void) {
     for (;;) {
         event e = input_wait(-1);
         if (e.type == EV_NONE) continue;
-        if (e.type == EV_POWER) { sleep_now(); continue; }
+        if (e.type == EV_POWER) { save_state(); sleep_now(); continue; }
         if (menu && e.type == EV_DOWN) {
             if (hit(back_btn, e.x, e.y)) press_on(back_btn);
             for (int i = 0; i < m_nb; i++) if (hit(m_b[i], e.x, e.y)) press_on(m_b[i]);
@@ -778,7 +837,7 @@ static void read_book(void) {
             } else { /* on */
                 if (bk.part < bk.nparts - 1) go(bk.page, bk.part + 1);
                 else if (bk.page < bk.pages - 1) go(bk.page + 1, 0);
-                else { toast("That's the end."); }
+                /* At the end, keep the final page unobscured. */
             }
             continue;
         }
@@ -883,26 +942,118 @@ static int lib_cmp(const void *a, const void *b) {
     return strcasecmp(x->b.title, y->b.title);
 }
 
-static void library(void) {
-    static item it[400];
+/* Match UTF-8 bytes exactly, with ASCII case folding for keyboard input.
+ * No metadata rendering or document opens are needed to search the list. */
+static int title_contains(const char *haystack, const char *needle) {
+    size_t n = strlen(needle);
+    if (!n) return 1;
+    for (const char *p = haystack; *p; p++) if (!strncasecmp(p, needle, n)) return 1;
+    return 0;
+}
+
+static int library_pick(int *reading, char *query, int query_size) {
+    enum { Y = 320, RH = 130 };
+    int per = (H - Y - 140) / RH, top = 0;
+    const int gap = 18, bw = (W - 2 * MARGIN - 2 * gap) / 3;
+    rect tabs[3];
+    for (int i = 0; i < 3; i++) tabs[i] = (rect){MARGIN + i * (bw + gap), 172, bw, 78};
+    const rect reload = {W - MARGIN - 210, 38, 210, 78};
+    const rect prev = {MARGIN, H - 120, 220, 90}, next = {W - MARGIN - 220, H - 120, 220, 90};
     for (;;) {
-        nlib = 0;
-        scan(DOCS, 0);
-        qsort(lib, nlib, sizeof *lib, lib_cmp);
+        int matches[400], n = 0;
         for (int i = 0; i < nlib; i++) {
-            const char *dot = strrchr(lib[i].path, '.');
-            char fmt[8] = "";
-            for (int k = 0; dot && dot[k + 1] && k < 6; k++) fmt[k] = (char)(dot[k + 1] >= 'a' ? dot[k + 1] - 32 : dot[k + 1]), fmt[k + 1] = 0;
-            snprintf(it[i].label, sizeof it[i].label, "%s", lib[i].b.title);
-            if (lib[i].b.pages) snprintf(it[i].sub, sizeof it[i].sub, "%s  %d%%", fmt, (lib[i].b.page + 1) * 100 / lib[i].b.pages);
-            else snprintf(it[i].sub, sizeof it[i].sub, "%s  new", fmt);
-            it[i].depth = 0;
+            if (*reading && !lib[i].b.opened) continue;
+            if (!title_contains(lib[i].b.title, query) && !title_contains(lib[i].path, query)) continue;
+            matches[n++] = i;
         }
-        int k = pick("Books", it, nlib, "Copy EPUB, PDF or text files into documents.", -1);
+        if (top >= n) top = n ? (n - 1) / per * per : 0;
+        header("Books");
+        pill(reload, "Refresh", 0);
+        pill(tabs[0], "All books", !*reading);
+        pill(tabs[1], "Reading", *reading);
+        pill(tabs[2], query[0] ? "Search *" : "Search", 0);
+        char info[180], fit[240];
+        snprintf(info, sizeof info, query[0] ? "%d books  -  %s" : "%d books  -  most recently opened first", n, query);
+        text_fit(&f_ui, 28, info, W - 2 * MARGIN, fit, sizeof fit);
+        text(&f_ui, 28, MARGIN, 274, fit, 0x50);
+        if (!n) {
+            text(&f_ui_bold, 36, MARGIN, Y + 60, query[0] ? "No matching books." : *reading ? "No books opened yet." : "Your library is empty.", BLACK);
+            text(&f_ui, 28, MARGIN, Y + 120, "Add books to documents, then tap Refresh.", 0x50);
+        }
+        for (int j = top; j < n && j < top + per; j++) {
+            entry *e = &lib[matches[j]];
+            int y = Y + (j - top) * RH;
+            text_fit(&f_ui_bold, 36, e->b.title, W - 2 * MARGIN - 20, fit, sizeof fit);
+            text(&f_ui_bold, 36, MARGIN, y + 12, fit, BLACK);
+            const char *dot = strrchr(e->path, '.');
+            char fmt[8] = "", detail[120];
+            for (int k = 0; dot && dot[k + 1] && k < 6; k++) {
+                char c = dot[k + 1];
+                fmt[k] = c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c;
+            }
+            if (e->b.pages > 0) {
+                int page = e->b.page < 0 ? 0 : e->b.page >= e->b.pages ? e->b.pages - 1 : e->b.page;
+                snprintf(detail, sizeof detail, "%s   %d%%   Page %d / %d", fmt, (int)((page + 1.0) * 100 / e->b.pages), page + 1, e->b.pages);
+            } else snprintf(detail, sizeof detail, "%s   Not opened", fmt);
+            text(&f_ui, 28, MARGIN, y + 68, detail, 0x40);
+            fill(MARGIN, y + RH - 8, W - 2 * MARGIN, 1, 0xB0);
+        }
+        if (top > 0) pill(prev, "Previous", 0);
+        if (top + per < n) pill(next, "Next", 0);
+        if (n) {
+            snprintf(info, sizeof info, "%d / %d", top / per + 1, (n + per - 1) / per);
+            text_center(&f_ui, 28, W / 2, H - 92, info, 0x50);
+        }
+        flip();
+        for (;;) {
+            event e = input_wait(-1);
+            if (e.type == EV_POWER) { sleep_now(); break; }
+            if (e.type == EV_DOWN) {
+                if (hit(back_btn, e.x, e.y)) press_on(back_btn);
+                else if (hit(reload, e.x, e.y)) press_on(reload);
+                else if (top > 0 && hit(prev, e.x, e.y)) press_on(prev);
+                else if (top + per < n && hit(next, e.x, e.y)) press_on(next);
+                else if (e.y >= Y && e.y < Y + per * RH && top + (e.y - Y) / RH < n)
+                    press_on((rect){MARGIN, Y + (e.y - Y) / RH * RH, W - 2 * MARGIN, RH - 8});
+                else for (int i = 0; i < 3; i++) if (hit(tabs[i], e.x, e.y)) press_on(tabs[i]);
+                continue;
+            }
+            if (e.type != EV_TAP) continue;
+            press_off();
+            if (hit(back_btn, e.x, e.y)) return -1;
+            if (hit(reload, e.x, e.y)) return -2;
+            if (hit(tabs[0], e.x, e.y)) { *reading = 0; top = 0; break; }
+            if (hit(tabs[1], e.x, e.y)) { *reading = 1; top = 0; break; }
+            if (hit(tabs[2], e.x, e.y)) {
+                char edit[96]; snprintf(edit, sizeof edit, "%s", query);
+                if (text_entry("Find a book", "Title or filename; empty shows all", edit, sizeof edit, 0)) {
+                    snprintf(query, query_size, "%s", edit); top = 0;
+                }
+                break;
+            }
+            if (top > 0 && hit(prev, e.x, e.y)) { top -= per; break; }
+            if (top + per < n && hit(next, e.x, e.y)) { top += per; break; }
+            if (e.y >= Y && e.y < Y + per * RH) {
+                int j = top + (e.y - Y) / RH;
+                if (j < n) return matches[j];
+            }
+        }
+    }
+}
+
+static void library(void) {
+    int reading = 0, rescan = 1;
+    char query[96] = "";
+    for (;;) {
+        if (rescan) { nlib = 0; scan(DOCS, 0); rescan = 0; }
+        qsort(lib, nlib, sizeof *lib, lib_cmp);
+        int k = library_pick(&reading, query, sizeof query);
+        if (k == -2) { rescan = 1; continue; }
         if (k < 0) return;
         toast("Opening...");
         if (open_book(lib[k].path)) { toast("This file could not be opened."); sleep(2); continue; }
         read_book();
+        lib[k].b = bk; /* update in memory: no full directory rescan on Back */
     }
 }
 
@@ -921,5 +1072,7 @@ int main(int argc, char **argv) {
         } else read_book();
     } else library();
     helper_stop();
+    clear_page_cache();
+    free(pg.px);
     return 0;
 }
