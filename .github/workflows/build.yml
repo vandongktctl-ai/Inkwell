@@ -17,6 +17,9 @@ jobs:
       - uses: actions/checkout@v4
 
 
+      - name: Reader regression checks
+        run: python3 tests/reader-regression.py
+
       - name: Build installer
         run: |
           docker run --rm \
@@ -25,15 +28,15 @@ jobs:
               apk add --no-cache clang llvm lld cmake samurai \
                 python3 e2fsprogs e2fsprogs-extra perl-utils \
                 curl zip xz binutils git
-                                git config --global --add safe.directory /work
-                  QUICK_ONLY=1 sh tools/fetch.sh
-              sh tools/release.sh ppw4-local
+              git config --global --add safe.directory /work
+              QUICK_ONLY=1 sh tools/fetch.sh
+              sh tools/release.sh ppw4-reading-1
             '
 
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Inkwell-PPW4
+          name: Inkwell-PPW4-Reading-1
           path: dist/
           if-no-files-found: error
 
